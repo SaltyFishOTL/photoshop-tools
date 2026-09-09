@@ -1,0 +1,7 @@
+/packages/
+/release/
+*.zip
+*.exe
+*.8bf
+install-result.json
+Backup-*

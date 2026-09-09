@@ -1,0 +1,196 @@
+// Color Sync 0.2.2 — local multilayer UXP trial
+try{await(async()=>{const engine=(()=>{'use strict';
+// Spatial colour-field matching. Geometry and alpha are never resampled.
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+function distance(a,b){return (a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2;}
+function bounds(im){
+ const {data:d,width:w,height:h}=im;let l=w,t=h,r=-1,b=-1;
+ for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){const i=(y*w+x)*4;if(d[i+3]<200||Math.min(d[i],d[i+1],d[i+2])>240)continue;l=Math.min(l,x);r=Math.max(r,x);t=Math.min(t,y);b=Math.max(b,y);}
+ if(r-l<8||b-t<8)throw Error('没有足够的人物像素');return {l,t,w:r-l+1,h:b-t+1};
+}
+function samples(im,b){
+ const out=[],{width:w,height:h,data:d}=im,step=Math.max(2,Math.ceil(Math.sqrt(w*h/80000)));
+ for(let y=2;y<h-2;y+=step)for(let x=2;x<w-2;x+=step){
+  const i=(y*w+x)*4,c=[d[i],d[i+1],d[i+2]],hi=Math.max(...c),lo=Math.min(...c);
+  if(d[i+3]<250||hi<38||lo>238||hi-lo<9)continue;
+  let edge=0;for(const j of [i-4,i+4,i-w*4,i+w*4])for(let k=0;k<3;k++)edge=Math.max(edge,Math.abs(d[i+k]-d[j+k]));
+  if(edge>10)continue;
+  out.push({c,x:clamp((x-b.l)/b.w,0,1),y:clamp((y-b.t)/b.h,0,1)});
+ }return out;
+}
+function palette(points){
+ const bins=new Map();for(const p of points){const key=p.c.map(x=>x>>4).join(',');let b=bins.get(key);if(!b){b={n:0,c:[0,0,0]};bins.set(key,b);}b.n++;for(let k=0;k<3;k++)b.c[k]+=p.c[k];}
+ const ranked=[...bins.values()].sort((a,b)=>b.n-a.n),centers=[];
+ for(const b of ranked){const c=b.c.map(x=>x/b.n);if(centers.every(v=>distance(c,v)>26*26)){centers.push(c);if(centers.length===8)break;}}
+ for(let it=0;it<6;it++){const sums=centers.map(()=>[0,0,0,0]);for(const p of points){const j=nearest(p.c,centers);if(distance(p.c,centers[j])>65*65)continue;const s=sums[j];s[3]++;for(let k=0;k<3;k++)s[k]+=p.c[k];}for(let j=0;j<centers.length;j++)if(sums[j][3])centers[j]=sums[j].slice(0,3).map(x=>x/sums[j][3]);}
+ return centers;
+}
+function nearest(c,p){let j=0,best=Infinity;for(let k=0;k<p.length;k++){const d=distance(c,p[k]);if(d<best){best=d;j=k;}}return j;}
+// Quadratic low-frequency field; robust fitting rejects remaining detail pixels.
+function basis(x,y){return [1,x,y,x*x,x*y,y*y];}
+function solve(a,b){const n=b.length,m=a.map((r,i)=>[...r,b[i]]);for(let i=0;i<n;i++){let p=i;for(let j=i+1;j<n;j++)if(Math.abs(m[j][i])>Math.abs(m[p][i]))p=j;[m[i],m[p]]=[m[p],m[i]];if(Math.abs(m[i][i])<1e-10)return null;const v=m[i][i];for(let k=i;k<=n;k++)m[i][k]/=v;for(let j=0;j<n;j++)if(j!==i){const f=m[j][i];for(let k=i;k<=n;k++)m[j][k]-=f*m[i][k];}}return m.map(r=>r[n]);}
+function value(model,x,y){const f=basis(x,y);return model.map(a=>a.reduce((s,v,k)=>s+v*f[k],0));}
+function fit(points){
+ if(points.length<30)return null;let model;
+ for(let pass=0;pass<3;pass++){
+  const a=Array.from({length:6},()=>Array(6).fill(0)),v=Array.from({length:3},()=>Array(6).fill(0));
+  for(const p of points){let weight=1;if(model){const residual=Math.sqrt(distance(p.c,value(model,p.x,p.y)));weight=Math.min(1,6/Math.max(1,residual));}const f=basis(p.x,p.y);for(let i=0;i<6;i++){for(let j=0;j<6;j++)a[i][j]+=weight*f[i]*f[j];for(let k=0;k<3;k++)v[k][i]+=weight*f[i]*p.c[k];}}
+  // Damping only curvature, not the constant or linear gradient.
+  for(let i=0;i<6;i++)a[i][i]+=i<3?1e-7:points.length*0.0001;
+  model=v.map(c=>solve(a,c));if(model.some(x=>!x))return null;
+ }return model;
+}
+function analyze(im,centers){const b=bounds(im),pts=samples(im,b);if(pts.length<100)throw Error('可匹配的平滑色块不足');const p=centers||palette(pts);const groups=p.map(()=>[]);for(const s of pts){const k=nearest(s.c,p);if(distance(s.c,p[k])<48*48)groups[k].push(s);}return {bounds:b,centers:p,models:groups.map(fit),counts:groups.map(g=>g.length)};}
+function prepare(ref){return analyze(ref);}
+function field(reference,target){
+ const t=analyze(target,reference.centers),b=t.bounds,grid=33,fields=reference.centers.map(()=>new Float32Array(grid*grid*3));let valid=0;
+ for(let k=0;k<fields.length;k++){
+  if(!reference.models[k]||!t.models[k])continue;valid++;
+  for(let y=0;y<grid;y++)for(let x=0;x<grid;x++){const u=x/(grid-1),v=y/(grid-1),r=value(reference.models[k],u,v),s=value(t.models[k],u,v);for(let c=0;c<3;c++)fields[k][(y*grid+x)*3+c]=clamp(r[c]-s[c],-24,24);}
+ }
+ if(valid<1)throw Error('没有匹配到共同色块');return {target:t,bounds:b,grid,fields,reference};
+}
+function rows(im,f,out,y0,y1){
+ const {data:d,width:w}=im,{bounds:b,grid:g,fields,reference}=f;let changed=0;
+ for(let y=y0;y<y1;y++)for(let x=0;x<w;x++){
+  const i=(y*w+x)*4;if(d[i+3]===0)continue;const c=[d[i],d[i+1],d[i+2]],hi=Math.max(...c),lo=Math.min(...c);
+  if(hi<32||lo>238||hi-lo<6)continue;
+  const k=nearest(c,reference.centers);if(!reference.models[k]||!f.target.models[k])continue;
+  const dist=Math.sqrt(distance(c,reference.centers[k]));
+  // Freeze black ink; taper uncertain colours instead of recolouring distinct details.
+  const weight=clamp((hi-32)/20,0,1)*clamp((56-dist)/18,0,1)*clamp((hi-lo-6)/8,0,1);if(!weight)continue;
+  const gx=clamp((x-b.l)/b.w,0,1)*(g-1),gy=clamp((y-b.t)/b.h,0,1)*(g-1),ix=Math.min(g-2,Math.floor(gx)),iy=Math.min(g-2,Math.floor(gy)),fx=gx-ix,fy=gy-iy,field=fields[k];let any=false;
+  for(let ch=0;ch<3;ch++){const a=(iy*g+ix)*3+ch;const delta=(field[a]*(1-fx)+field[a+3]*fx)*(1-fy)+(field[a+g*3]*(1-fx)+field[a+g*3+3]*fx)*fy;out[i+ch]=clamp(Math.round(d[i+ch]+delta*weight),0,255);any=any||out[i+ch]!==d[i+ch];}if(any)changed++;
+ }return changed;
+}
+async function synchronize(reference,target,tick=async()=>{}){const f=field(reference,target),out=new Uint8Array(target.data);let changed=0;for(let y=0;y<target.height;y+=32){await tick(y/target.height);changed+=rows(target,f,out,y,Math.min(target.height,y+32));}await tick(1);return {data:out,changed,analysis:f.target};}
+return {prepare,synchronize,analyze,value};
+})();const createHost=(()=>{'use strict';
+function createHost(ps,engine,context){
+ const {app,imaging,constants,action}=ps;
+ function capture(){
+  if(!app.documents.length)throw Error('请先打开含有相似图层的文档');const doc=app.activeDocument;
+  if(doc.mode!==constants.DocumentMode.RGB||doc.bitsPerChannel!==constants.BitsPerChannelType.EIGHT)throw Error('试用版需要 RGB / 8 位文档');
+  const layers=[];
+  function collect(items,prefix=''){for(const l of items){if(l.kind===constants.LayerKind.GROUP)collect(l.layers,prefix+l.name+' / ');else if(l.kind===constants.LayerKind.NORMAL&&!l.isBackgroundLayer)layers.push({layer:l,name:prefix+l.name});}}
+  collect(doc.layers);
+  const active=doc.activeLayers.length===1?doc.activeLayers[0]:null;
+  const reference=active&&layers.some(i=>i.layer.id===active.id)?active:null;
+  return {doc,reference,layers,historyID:doc.activeHistoryState.id};
+ }
+ async function validate(layer){
+  if(layer.kind!==constants.LayerKind.NORMAL||layer.isBackgroundLayer)throw Error(layer.name+'：请使用普通像素图层（智能对象可先复制并栅格化）');
+  const [d]=await action.batchPlay([{_obj:'get',_target:[{_ref:'layer',_id:layer.id}],_options:{dialogOptions:'dontDisplay'}}],{});
+  if(!d||d._obj==='error')throw Error('无法检查图层：'+layer.name);
+  if(d.group===true||layer.isClippingMask===true)throw Error(layer.name+'：这是剪贴图层，颜色依赖下方图层；当前版请使用未剪贴的像素副本');
+  if(d.hasUserMask||d.hasVectorMask||d.layerEffects)throw Error(layer.name+'：试用版暂不处理蒙版或图层效果，请先准备独立像素副本');
+  function percent(raw,fallback){
+   if(raw&&typeof raw==='object'&&Number.isFinite(raw._value)&&raw._unit==='percentUnit')return raw._value;
+   if(typeof raw==='number'&&raw>=0&&raw<=255)return raw*100/255;
+   const n=Number(fallback);if(Number.isFinite(n)&&n>=0&&n<=100)return n;
+   throw Error(layer.name+'：无法读取图层不透明度（宿主返回 '+String(raw)+' / '+String(fallback)+'）');
+  }
+  const opacity=percent(d.opacity,layer.opacity),fill=percent(d.fillOpacity,layer.fillOpacity),mode=d.mode&&d.mode._value||layer.blendMode;
+  if(typeof mode!=='string'||!mode)throw Error(layer.name+'：无法读取混合模式');
+  return {opacity,fill,mode};
+ }
+ async function appearance(layer,values){
+  const [result]=await action.batchPlay([{_obj:'set',_target:[{_ref:'layer',_id:layer.id}],to:{_obj:'layer',opacity:{_unit:'percentUnit',_value:values.opacity},fillOpacity:{_unit:'percentUnit',_value:values.fill},mode:{_enum:'blendMode',_value:values.mode}},_options:{dialogOptions:'dontDisplay'}}],{});
+  if(result&&result._obj==='error')throw Error(layer.name+'：无法设置读取状态：'+(result.message||result.result));
+ }
+ async function normalizedRead(doc,layer,settings){
+  if(Math.abs(settings.opacity-100)<.001&&Math.abs(settings.fill-100)<.001&&settings.mode==='normal')return read(doc,layer);
+  // Change only appearance inside the history transaction, then restore even on failure.
+  try{await appearance(layer,{opacity:100,fill:100,mode:'normal'});return await read(doc,layer);}
+  finally{await appearance(layer,settings);}
+ }
+ async function read(doc,layer){
+  const b=layer.boundsNoEffects,bounds={left:Math.floor(b.left),top:Math.floor(b.top),right:Math.ceil(b.right),bottom:Math.ceil(b.bottom)};
+  if((bounds.right-bounds.left)*(bounds.bottom-bounds.top)>20000000)throw Error('单层超过 2000 万像素，试用版暂不处理');
+  let response;
+  try{response=await imaging.getPixels({documentID:doc.id,layerID:layer.id,sourceBounds:bounds,componentSize:8,applyAlpha:false});const im=response.imageData;
+   if(!im||!im.width||!im.height||![3,4].includes(im.components))throw Error('图层没有可读取的 RGB 像素：'+layer.name);
+   const raw=await im.getData({chunky:true}),data=new Uint8Array(im.width*im.height*4);
+   for(let p=0;p<im.width*im.height;p++){for(let c=0;c<3;c++)data[p*4+c]=raw[p*im.components+c];data[p*4+3]=im.components===4?raw[p*4+3]:255;}
+   return {data,width:im.width,height:im.height,bounds:response.sourceBounds,profile:im.colorProfile};
+  }finally{if(response&&response.imageData)response.imageData.dispose();}
+ }
+ async function apply(state,targets,tick){
+  if(!state.reference||!state.layers.some(i=>i.layer.id===state.reference.id))throw Error('请选择一个参考图层');
+  if(!targets.length)throw Error('请勾选至少一个需要同步的图层');
+  if(targets.some(l=>!state.layers.some(i=>i.layer.id===l.id)))throw Error('目标图层不在当前文档列表中');
+  if(app.activeDocument.id!==state.doc.id||state.doc.activeHistoryState.id!==state.historyID)throw Error('文档已改变，请关闭工具后重新运行');
+  if(targets.some(l=>l.id===state.reference.id)||new Set(targets.map(l=>l.id)).size!==targets.length)throw Error('目标图层不能重复或包含参考图层');
+  if(state.doc.selection.bounds)throw Error('请先取消像素选区，再同步完整图层');
+  const settings=new Map();for(const l of [state.reference,...targets])settings.set(l.id,await validate(l));
+  const suspension=await context.hostControl.suspendHistory({documentID:state.doc.id,name:'统一图层配色与渐变'});let ok=false;const created=[];
+  try{
+   await tick('读取参考层 '+state.reference.name,0);
+   const refImage=await normalizedRead(state.doc,state.reference,settings.get(state.reference.id)),ref=engine.prepare(refImage);refImage.data=null;
+   for(let n=0;n<targets.length;n++){
+    await tick('读取 '+targets[n].name,n/targets.length);
+    const source=await normalizedRead(state.doc,targets[n],settings.get(targets[n].id)),result=await engine.synchronize(ref,source,p=>tick('同步 '+targets[n].name, (n+p)/targets.length));
+    const visible=targets[n].visible,copy=await targets[n].duplicate();copy.allLocked=false;copy.name=targets[n].name+' · 配色同步';copy.pixelsLocked=false;copy.transparentPixelsLocked=false;
+    let im;try{im=await imaging.createImageDataFromBuffer(result.data,{width:source.width,height:source.height,components:4,colorSpace:'RGB',colorProfile:source.profile});await imaging.putPixels({documentID:state.doc.id,layerID:copy.id,imageData:im,replace:true,targetBounds:{left:source.bounds.left,top:source.bounds.top}});}finally{if(im)im.dispose();}
+    copy.visible=visible;targets[n].visible=false;created.push(copy);
+   }
+   await tick('完成',1);ok=true;
+  }finally{await context.hostControl.resumeHistory(suspension,ok);}
+  return created;
+ }
+ return {capture,apply,read};
+}
+return createHost;
+})();
+const ps=require('photoshop'),context=require('uxp').script.executionContext;
+const host=createHost(ps,engine,context),state=host.capture();
+const dialog=document.createElement('dialog');
+dialog.innerHTML="<style>\ndialog{width:860px;height:660px;padding:14px;background:#292929;color:#eee;overflow:hidden;}\nh2{font-size:16px;height:22px;margin:0 0 8px;}\np{font-size:12px;line-height:16px;margin:4px 0;}\nbutton{height:28px;min-height:28px;padding:3px 8px;margin:0 6px 0 0;background:#454545;color:white;font-size:12px;}\n.columns{display:flex;flex-direction:row;height:490px;}\n.column{width:410px;min-width:0;display:flex;flex-direction:column;}\n.left{margin-right:12px;}\n.title{font-size:13px;height:20px;margin:0 0 4px;}\n.search{display:block;width:100%;height:26px;min-height:26px;padding:3px 6px;margin:0 0 6px;background:#383838;color:white;font-size:12px;}\n.list{height:392px;min-height:392px;max-height:392px;overflow:auto;border:1px solid #555;padding:2px;}\nbutton.layer{display:block;width:100%;height:25px;min-height:25px;max-height:25px;padding:2px 5px;margin:0 0 1px;text-align:left;font-size:11px;line-height:19px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}\nbutton.selected{background:#315f75;color:#fff;}\n.tools{display:flex;flex-direction:row;margin-top:5px;height:26px;}\n.tools button{height:25px;min-height:25px;font-size:11px;padding:2px 7px;}\n#reference{height:28px;overflow:hidden;font-size:11px;}\n#picked{height:18px;margin:5px 0 3px;}\n#status{height:34px;min-height:34px;margin:2px 0 5px;color:#bde6cf;white-space:pre-wrap;overflow:auto;font-size:11px;line-height:15px;}\n.footer{display:flex;flex-direction:row;justify-content:flex-end;height:29px;}\n</style>\n<h2>统一配色与渐变 · 0.4.1</h2>\n<div class=\"columns\">\n <div class=\"column left\"><p class=\"title\">参考图层 · 单选</p><input type=\"text\" class=\"search\" id=\"refSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"refList\"></div><p id=\"reference\"></p></div>\n <div class=\"column\"><p class=\"title\">同步图层 · 多选</p><input type=\"text\" class=\"search\" id=\"targetSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"targetList\"></div><div class=\"tools\"><button id=\"selectShown\">选择搜索结果</button><button id=\"clear\">清空选择</button></div></div>\n</div>\n<p id=\"picked\"></p><p id=\"status\">点击图层整行选择；选中变蓝。结果生成副本。</p>\n<div class=\"footer\"><button id=\"apply\">同步配色</button><button id=\"close\">关闭</button></div>";
+document.body.appendChild(dialog);const $=id=>dialog.querySelector('#'+id);
+let busy=false,cancelled=false,completed=false;
+const refs=[],targets=[],selected=new Set();
+function errorText(e){if(e&&e.message)return e.message;if(typeof e==='string')return e;try{return JSON.stringify(e)||String(e);}catch(ignore){return String(e);}}
+function status(text){$('status').textContent=text;}
+function matches(name,query){return String(name).toLowerCase().includes(String(query||'').trim().toLowerCase());}
+function refresh(){
+ const id=state.reference?state.reference.id:null;if(id!==null)selected.delete(id);
+ for(const v of refs){const active=v.layer.id===id;v.button.textContent=(active?'[参考] ':'[选择] ')+v.label;v.button.className=active?'layer selected':'layer';v.button.disabled=busy||completed;v.button.style.display=matches(v.name,$('refSearch').value)?'block':'none';}
+ for(const v of targets){const active=selected.has(v.layer.id),isRef=v.layer.id===id;v.button.textContent=(isRef?'[参考层] ':active?'[已选] ':'[选择] ')+v.label;v.button.className=active?'layer selected':'layer';v.button.disabled=busy||completed||isRef;v.button.style.display=matches(v.name,$('targetSearch').value)?'block':'none';}
+ const ref=state.layers.find(i=>i.layer.id===id);$('reference').textContent=ref?'参考：'+ref.name:'尚未选择参考图层';
+ const hidden=targets.filter(v=>selected.has(v.layer.id)&&!matches(v.name,$('targetSearch').value)).length;
+ $('picked').textContent='已选择 '+selected.size+' 个同步图层'+(hidden?'（其中 '+hidden+' 个在当前搜索结果之外）':'');
+ for(const key of ['refSearch','targetSearch','selectShown','clear'])$(key).disabled=busy||completed;
+ // Keep Apply clickable before selection: every click must explain what is missing.
+ $('apply').disabled=busy||completed;
+}
+function bind(el,event,fn){el.addEventListener(event,async()=>{try{await fn();}catch(e){busy=false;status('操作失败：'+errorText(e));console.error(e);try{refresh();}catch(ignore){}}});}
+for(const item of state.layers){
+ const label=item.name+'  [ID '+item.layer.id+']'+(item.layer.visible?'':'（隐藏）');
+ for(const isRef of [true,false]){
+  const button=document.createElement('button');button.type='button';button.title=label;$(isRef?'refList':'targetList').appendChild(button);
+  const entry={button,layer:item.layer,name:item.name,label};(isRef?refs:targets).push(entry);
+  bind(button,'click',()=>{if(busy||completed)return;if(isRef){state.reference=item.layer;selected.delete(item.layer.id);status('已设为参考：'+item.name);}else{if(state.reference&&state.reference.id===item.layer.id)return;if(selected.has(item.layer.id))selected.delete(item.layer.id);else selected.add(item.layer.id);status('已选择 '+selected.size+' 个同步图层');}refresh();});
+ }
+}
+bind($('refSearch'),'input',refresh);bind($('targetSearch'),'input',refresh);
+bind($('selectShown'),'click',()=>{for(const v of targets)if(!v.button.disabled&&matches(v.name,$('targetSearch').value))selected.add(v.layer.id);refresh();status('已选择 '+selected.size+' 个同步图层');});
+bind($('clear'),'click',()=>{selected.clear();refresh();status('已清空同步图层选择');});
+if(context.onCancel&&context.onCancel.addListener)context.onCancel.addListener(()=>{cancelled=true;});
+bind($('close'),'click',()=>{if(busy){cancelled=true;status('正在取消并回滚…');}else dialog.close();});
+bind($('apply'),'click',async()=>{
+ if(busy||completed)return;
+ if(!state.reference){status('请先在上方点击一个图层，设为参考。');return;}
+ const chosen=targets.filter(v=>selected.has(v.layer.id)&&v.layer.id!==state.reference.id).map(v=>v.layer);
+ if(!chosen.length){status('请在下方点击至少一个需要同步的图层；选中的行会显示“已选”。');return;}
+ try{
+  busy=true;cancelled=false;status('已收到操作，正在检查 '+chosen.length+' 个图层…');refresh();$('close').textContent='取消';
+  await new Promise(resolve=>setTimeout(resolve,30));
+  const created=await host.apply(state,chosen,async(text,p)=>{if(cancelled||context.isCancelled)throw Error('已取消');status(text+' '+Math.round(p*100)+'%');await new Promise(resolve=>setTimeout(resolve,1));if(cancelled||context.isCancelled)throw Error('已取消');});
+  completed=true;status('已生成 '+created.length+' 个配色同步副本。关闭窗口，在图层面板分别显示副本查看；原层保留，可一次撤销。');$('apply').textContent='已完成';
+ }catch(e){status('未完成：'+errorText(e));console.error(e);}
+ finally{busy=false;$('close').textContent='关闭';refresh();}
+});
+if(!state.layers.length)status('未找到普通像素图层。若图片是智能对象，请先复制并栅格化副本，再运行。');
+refresh();try{await dialog.showModal();}finally{dialog.remove();}
+
+})();}catch(e){await require('photoshop').core.showAlert('统一配色：'+(e&&e.message?e.message:String(e)));}

@@ -1,0 +1,7 @@
+/build/
+/dist/
+/PiPLs.json
+*.rgba
+/cpp-cases-validation.json
+*.8bf
+*.zip

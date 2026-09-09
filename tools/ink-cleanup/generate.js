@@ -1,0 +1,10 @@
+const fs=require('fs'),path=require('path');
+if(!process.argv[2])throw new Error('Usage: node generate.js <Photoshop SDK root>');
+const base=JSON.parse(fs.readFileSync(path.join(process.argv[2],'pluginsdk/samplecode/filter/dissolve/common/PiPLs.json'))).PiPLs[0];
+Object.assign(base,{Name:'All Color Cleanup...',Category:'Ink Cleanup',ComponentName:'InkCleanupNative',ComponentVersionShortNum:0,ComponentVersionMinorRevNum:9,ComponentVersionDotRevNum:0,EnableInfo:'in (PSHOP_ImageMode, RGBMode) && PSHOP_ImageDepth == 8',MonitorScalingAware:true});
+for(const k in base.SupportedModes)base.SupportedModes[k]=k==='RGBColor';
+for(const c of base.FilterCaseInfo)Object.assign(c,{InputHandling:'InStraightData',OutputHandling:'OutStraightData',WriteOutsideSelection:false,FiltersLayerMasks:false,WorksWithBlankData:true});
+base.HasTerminology={ClassID:'Ic07',EventID:'Ic07',ScopeString:'d38b4a76-4a37-4ae3-a650-32d5c5f6ce07'};
+const suite=base.Terminology.Suites[0];suite.SuitName='Ink Cleanup';suite.SuitID='Ic07';suite.SuitDescription='All color isolated speck cleanup';delete suite.Enumerations;
+const event=suite.Events[0];Object.assign(event,{EventName:'All Color Cleanup',EventDescription:'Cleanup engine 0.7',ClassID:'Ic07',EventType:'Ic07',Parameters:[{ParamName:'strength',ParamKeyword:'IcSt',ParamType:'long',ParamDescription:'Recognition strength'},{ParamName:'maximum area',ParamKeyword:'IcAr',ParamType:'long',ParamDescription:'Maximum component pixels'}]});
+fs.writeFileSync(__dirname+'/PiPLs.json',JSON.stringify({PiPLs:[base]},null,2));
