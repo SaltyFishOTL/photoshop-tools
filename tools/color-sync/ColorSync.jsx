@@ -8,7 +8,7 @@
 */
 #target photoshop
 (function(){
- var helper=new File(Folder.userData.fsName+'/ColorSync/ColorSyncLauncher.exe');
- if(!helper.exists){alert('Color Sync installation is incomplete. Reinstall the package.');return;}
+ var helper=new File(Folder.userData.fsName+'/Adobe/ColorSync/ColorSyncLauncher.exe');
+ if(!helper.exists){alert('Color Sync helper is missing or inaccessible. Reinstall the package. Path: '+helper.fsName);return;}
  if(!helper.execute())alert('Windows could not start Color Sync.');
 })();

@@ -1,6 +1,6 @@
 $ErrorActionPreference='Stop'
 $scripts='C:\Program Files\Adobe\Adobe Photoshop 2025\Presets\Scripts'
-$data=Join-Path $env:APPDATA 'ColorSync'
+$data=Join-Path $env:APPDATA 'Adobe\ColorSync'
 if(!(Test-Path -LiteralPath $scripts)){throw 'Photoshop 2025 script directory not found'}
 $backup=Join-Path $data ('Backup-'+(Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $backup -Force | Out-Null

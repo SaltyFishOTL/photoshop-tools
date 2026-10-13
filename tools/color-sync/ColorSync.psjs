@@ -1,4 +1,4 @@
-// Color Sync 0.2.2 — local multilayer UXP trial
+// Color Sync 0.6.0 — bounded in-memory colour refinement
 try{await(async()=>{const engine=(()=>{'use strict';
 // Spatial colour-field matching. Geometry and alpha are never resampled.
 const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -63,7 +63,21 @@ function rows(im,f,out,y0,y1){
   for(let ch=0;ch<3;ch++){const a=(iy*g+ix)*3+ch;const delta=(field[a]*(1-fx)+field[a+3]*fx)*(1-fy)+(field[a+g*3]*(1-fx)+field[a+g*3+3]*fx)*fy;out[i+ch]=clamp(Math.round(d[i+ch]+delta*weight),0,255);any=any||out[i+ch]!==d[i+ch];}if(any)changed++;
  }return changed;
 }
-async function synchronize(reference,target,tick=async()=>{}){const f=field(reference,target),out=new Uint8Array(target.data);let changed=0;for(let y=0;y<target.height;y+=32){await tick(y/target.height);changed+=rows(target,f,out,y,Math.min(target.height,y+32));}await tick(1);return {data:out,changed,analysis:f.target};}
+async function synchronize(reference,target,tick=async()=>{}){
+ // Refine in memory, using the same guarded step as repeated manual runs.
+ // Never accumulate baked mask alpha or reread/rewrite Photoshop layers between rounds.
+ let current=target,analysis,passes=0;const maxPasses=3;
+ for(let pass=0;pass<maxPasses;pass++){
+  const f=field(reference,current),out=new Uint8Array(current.data);let changed=0;
+  for(let y=0;y<target.height;y+=32){await tick((pass+y/target.height)/maxPasses);changed+=rows(current,f,out,y,Math.min(target.height,y+32));}
+  analysis=f.target;passes++;
+  current={...target,data:out};
+  // Exact pixel stability is safer than a global mean: small colour regions still matter.
+  if(!changed)break;
+ }
+ let changed=0;for(let i=0;i<target.data.length;i+=4)if(current.data[i]!==target.data[i]||current.data[i+1]!==target.data[i+1]||current.data[i+2]!==target.data[i+2])changed++;
+ await tick(1);return {data:current.data,changed,analysis,passes};
+}
 return {prepare,synchronize,analyze,value};
 })();const createHost=(()=>{'use strict';
 function createHost(ps,engine,context){
@@ -83,7 +97,7 @@ function createHost(ps,engine,context){
   const [d]=await action.batchPlay([{_obj:'get',_target:[{_ref:'layer',_id:layer.id}],_options:{dialogOptions:'dontDisplay'}}],{});
   if(!d||d._obj==='error')throw Error('无法检查图层：'+layer.name);
   if(d.group===true||layer.isClippingMask===true)throw Error(layer.name+'：这是剪贴图层，颜色依赖下方图层；当前版请使用未剪贴的像素副本');
-  if(d.hasUserMask||d.hasVectorMask||d.layerEffects)throw Error(layer.name+'：试用版暂不处理蒙版或图层效果，请先准备独立像素副本');
+  if(d.hasVectorMask||d.layerEffects)throw Error(layer.name+'：暂不处理矢量蒙版或图层效果；普通图层蒙版已支持');
   function percent(raw,fallback){
    if(raw&&typeof raw==='object'&&Number.isFinite(raw._value)&&raw._unit==='percentUnit')return raw._value;
    if(typeof raw==='number'&&raw>=0&&raw<=255)return raw*100/255;
@@ -92,20 +106,53 @@ function createHost(ps,engine,context){
   }
   const opacity=percent(d.opacity,layer.opacity),fill=percent(d.fillOpacity,layer.fillOpacity),mode=d.mode&&d.mode._value||layer.blendMode;
   if(typeof mode!=='string'||!mode)throw Error(layer.name+'：无法读取混合模式');
-  return {opacity,fill,mode};
+  return {opacity,fill,mode,hasMask:!!d.hasUserMask,maskEnabled:d.userMaskEnabled!==false};
  }
  async function appearance(layer,values){
   const [result]=await action.batchPlay([{_obj:'set',_target:[{_ref:'layer',_id:layer.id}],to:{_obj:'layer',opacity:{_unit:'percentUnit',_value:values.opacity},fillOpacity:{_unit:'percentUnit',_value:values.fill},mode:{_enum:'blendMode',_value:values.mode}},_options:{dialogOptions:'dontDisplay'}}],{});
   if(result&&result._obj==='error')throw Error(layer.name+'：无法设置读取状态：'+(result.message||result.result));
  }
  async function normalizedRead(doc,layer,settings){
+  if(settings.hasMask)return maskedRead(doc,layer,settings);
   if(Math.abs(settings.opacity-100)<.001&&Math.abs(settings.fill-100)<.001&&settings.mode==='normal')return read(doc,layer);
   // Change only appearance inside the history transaction, then restore even on failure.
   try{await appearance(layer,{opacity:100,fill:100,mode:'normal'});return await read(doc,layer);}
   finally{await appearance(layer,settings);}
  }
+ async function maskEnabled(layer,enabled){
+  const [r]=await action.batchPlay([{_obj:'set',_target:[{_ref:'layer',_id:layer.id}],to:{_obj:'layer',userMaskEnabled:enabled},_options:{dialogOptions:'dontDisplay'}}],{});
+  if(r&&r._obj==='error')throw Error('无法切换临时蒙版：'+(r.message||r.result));
+ }
+ async function maskedRead(doc,layer,settings){
+  // Bake only a disposable duplicate. Keep original pixels and the editable mask untouched.
+  const temp=await layer.duplicate();
+  try{
+   temp.allLocked=false;temp.pixelsLocked=false;temp.transparentPixelsLocked=false;
+   await appearance(temp,{opacity:100,fill:100,mode:'normal'});
+   await maskEnabled(temp,false);
+   const raw=await read(doc,temp);
+   if(!settings.maskEnabled)return raw;
+   await maskEnabled(temp,true);
+   const [r]=await action.batchPlay([{_obj:'delete',_target:[{_ref:'channel',_enum:'channel',_value:'mask'},{_ref:'layer',_id:temp.id}],apply:true,_options:{dialogOptions:'dontDisplay'}}],{});
+   if(r&&r._obj==='error')throw Error('无法应用临时蒙版：'+(r.message||r.result));
+   const visible=await read(doc,temp);visible.raw=raw;return visible;
+  }finally{await temp.delete();}
+ }
+ function restorePixels(source,result){
+  if(!source.raw)return {data:result.data,image:source};
+  const raw=source.raw,out=new Uint8Array(raw.data);
+  const dx=source.bounds.left-raw.bounds.left,dy=source.bounds.top-raw.bounds.top;
+  // Copy colour only. Baking alpha then restoring the mask would apply soft edges twice.
+  for(let y=0;y<source.height;y++)for(let x=0;x<source.width;x++){
+   const s=(y*source.width+x)*4,rx=x+dx,ry=y+dy;
+   if(!source.data[s+3]||rx<0||ry<0||rx>=raw.width||ry>=raw.height)continue;
+   const d=(ry*raw.width+rx)*4;for(let c=0;c<3;c++)out[d+c]=result.data[s+c];
+  }
+  return {data:out,image:raw};
+ }
  async function read(doc,layer){
   const b=layer.boundsNoEffects,bounds={left:Math.floor(b.left),top:Math.floor(b.top),right:Math.ceil(b.right),bottom:Math.ceil(b.bottom)};
+  if(bounds.right<=bounds.left||bounds.bottom<=bounds.top)throw Error(layer.name+'：图层为空或蒙版完全遮住了图层，没有可用于同步的颜色');
   if((bounds.right-bounds.left)*(bounds.bottom-bounds.top)>20000000)throw Error('单层超过 2000 万像素，试用版暂不处理');
   let response;
   try{response=await imaging.getPixels({documentID:doc.id,layerID:layer.id,sourceBounds:bounds,componentSize:8,applyAlpha:false});const im=response.imageData;
@@ -126,12 +173,13 @@ function createHost(ps,engine,context){
   const suspension=await context.hostControl.suspendHistory({documentID:state.doc.id,name:'统一图层配色与渐变'});let ok=false;const created=[];
   try{
    await tick('读取参考层 '+state.reference.name,0);
-   const refImage=await normalizedRead(state.doc,state.reference,settings.get(state.reference.id)),ref=engine.prepare(refImage);refImage.data=null;
+   const refImage=await normalizedRead(state.doc,state.reference,settings.get(state.reference.id)),ref=engine.prepare(refImage);refImage.data=null;refImage.raw=null;
    for(let n=0;n<targets.length;n++){
     await tick('读取 '+targets[n].name,n/targets.length);
     const source=await normalizedRead(state.doc,targets[n],settings.get(targets[n].id)),result=await engine.synchronize(ref,source,p=>tick('同步 '+targets[n].name, (n+p)/targets.length));
+    const restored=restorePixels(source,result),output=restored.image;
     const visible=targets[n].visible,copy=await targets[n].duplicate();copy.allLocked=false;copy.name=targets[n].name+' · 配色同步';copy.pixelsLocked=false;copy.transparentPixelsLocked=false;
-    let im;try{im=await imaging.createImageDataFromBuffer(result.data,{width:source.width,height:source.height,components:4,colorSpace:'RGB',colorProfile:source.profile});await imaging.putPixels({documentID:state.doc.id,layerID:copy.id,imageData:im,replace:true,targetBounds:{left:source.bounds.left,top:source.bounds.top}});}finally{if(im)im.dispose();}
+    let im;try{im=await imaging.createImageDataFromBuffer(restored.data,{width:output.width,height:output.height,components:4,colorSpace:'RGB',colorProfile:output.profile});await imaging.putPixels({documentID:state.doc.id,layerID:copy.id,imageData:im,replace:true,targetBounds:{left:output.bounds.left,top:output.bounds.top}});}finally{if(im)im.dispose();}
     copy.visible=visible;targets[n].visible=false;created.push(copy);
    }
    await tick('完成',1);ok=true;
@@ -145,7 +193,7 @@ return createHost;
 const ps=require('photoshop'),context=require('uxp').script.executionContext;
 const host=createHost(ps,engine,context),state=host.capture();
 const dialog=document.createElement('dialog');
-dialog.innerHTML="<style>\ndialog{width:860px;height:660px;padding:14px;background:#292929;color:#eee;overflow:hidden;}\nh2{font-size:16px;height:22px;margin:0 0 8px;}\np{font-size:12px;line-height:16px;margin:4px 0;}\nbutton{height:28px;min-height:28px;padding:3px 8px;margin:0 6px 0 0;background:#454545;color:white;font-size:12px;}\n.columns{display:flex;flex-direction:row;height:490px;}\n.column{width:410px;min-width:0;display:flex;flex-direction:column;}\n.left{margin-right:12px;}\n.title{font-size:13px;height:20px;margin:0 0 4px;}\n.search{display:block;width:100%;height:26px;min-height:26px;padding:3px 6px;margin:0 0 6px;background:#383838;color:white;font-size:12px;}\n.list{height:392px;min-height:392px;max-height:392px;overflow:auto;border:1px solid #555;padding:2px;}\nbutton.layer{display:block;width:100%;height:25px;min-height:25px;max-height:25px;padding:2px 5px;margin:0 0 1px;text-align:left;font-size:11px;line-height:19px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}\nbutton.selected{background:#315f75;color:#fff;}\n.tools{display:flex;flex-direction:row;margin-top:5px;height:26px;}\n.tools button{height:25px;min-height:25px;font-size:11px;padding:2px 7px;}\n#reference{height:28px;overflow:hidden;font-size:11px;}\n#picked{height:18px;margin:5px 0 3px;}\n#status{height:34px;min-height:34px;margin:2px 0 5px;color:#bde6cf;white-space:pre-wrap;overflow:auto;font-size:11px;line-height:15px;}\n.footer{display:flex;flex-direction:row;justify-content:flex-end;height:29px;}\n</style>\n<h2>统一配色与渐变 · 0.4.1</h2>\n<div class=\"columns\">\n <div class=\"column left\"><p class=\"title\">参考图层 · 单选</p><input type=\"text\" class=\"search\" id=\"refSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"refList\"></div><p id=\"reference\"></p></div>\n <div class=\"column\"><p class=\"title\">同步图层 · 多选</p><input type=\"text\" class=\"search\" id=\"targetSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"targetList\"></div><div class=\"tools\"><button id=\"selectShown\">选择搜索结果</button><button id=\"clear\">清空选择</button></div></div>\n</div>\n<p id=\"picked\"></p><p id=\"status\">点击图层整行选择；选中变蓝。结果生成副本。</p>\n<div class=\"footer\"><button id=\"apply\">同步配色</button><button id=\"close\">关闭</button></div>";
+dialog.innerHTML="<style>\ndialog{width:860px;height:660px;padding:14px;background:#292929;color:#eee;overflow:hidden;}\nh2{font-size:16px;height:22px;margin:0 0 8px;}\np{font-size:12px;line-height:16px;margin:4px 0;}\nbutton{height:28px;min-height:28px;padding:3px 8px;margin:0 6px 0 0;background:#454545;color:white;font-size:12px;}\n.columns{display:flex;flex-direction:row;height:490px;}\n.column{width:410px;min-width:0;display:flex;flex-direction:column;}\n.left{margin-right:12px;}\n.title{font-size:13px;height:20px;margin:0 0 4px;}\n.search{display:block;width:100%;height:26px;min-height:26px;padding:3px 6px;margin:0 0 6px;background:#383838;color:white;font-size:12px;}\n.list{height:392px;min-height:392px;max-height:392px;overflow:auto;border:1px solid #555;padding:2px;}\nbutton.layer{display:block;width:100%;height:25px;min-height:25px;max-height:25px;padding:2px 5px;margin:0 0 1px;text-align:left;font-size:11px;line-height:19px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}\nbutton.selected{background:#315f75;color:#fff;}\n.tools{display:flex;flex-direction:row;margin-top:5px;height:26px;}\n.tools button{height:25px;min-height:25px;font-size:11px;padding:2px 7px;}\n#reference{height:28px;overflow:hidden;font-size:11px;}\n#picked{height:18px;margin:5px 0 3px;}\n#status{height:34px;min-height:34px;margin:2px 0 5px;color:#bde6cf;white-space:pre-wrap;overflow:auto;font-size:11px;line-height:15px;}\n.footer{display:flex;flex-direction:row;justify-content:flex-end;height:29px;}\n</style>\n<h2>统一配色与渐变 · 0.6.0</h2>\n<div class=\"columns\">\n <div class=\"column left\"><p class=\"title\">参考图层 · 单选</p><input type=\"text\" class=\"search\" id=\"refSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"refList\"></div><p id=\"reference\"></p></div>\n <div class=\"column\"><p class=\"title\">同步图层 · 多选</p><input type=\"text\" class=\"search\" id=\"targetSearch\" placeholder=\"搜索名称 / 图层组\"><div class=\"list\" id=\"targetList\"></div><div class=\"tools\"><button id=\"selectShown\">选择搜索结果</button><button id=\"clear\">清空选择</button></div></div>\n</div>\n<p id=\"picked\"></p><p id=\"status\">点击图层整行选择；选中变蓝。结果生成副本。</p>\n<div class=\"footer\"><button id=\"apply\">同步配色</button><button id=\"close\">关闭</button></div>";
 document.body.appendChild(dialog);const $=id=>dialog.querySelector('#'+id);
 let busy=false,cancelled=false,completed=false;
 const refs=[],targets=[],selected=new Set();
