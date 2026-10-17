@@ -7,12 +7,72 @@
 #include <stdexcept>
 namespace {
 using Color=std::array<double,3>;
-struct Group {std::vector<int> points;bool solid=false;Color background{};};
+struct Group {std::vector<int> points;bool solid=false;Color background{};std::vector<int> boundary;};
 int Sign(int x){return (x>0)-(x<0);}
 void Cancel(const std::atomic<bool>& cancel){if(cancel.load(std::memory_order_relaxed))throw std::runtime_error("Cancelled");}
 double Difference(const uint8_t* a,const Color& b){return std::max({std::abs(a[0]-b[0]),std::abs(a[1]-b[1]),std::abs(a[2]-b[2])});}
 double Difference(const Color& a,const Color& b){return std::max({std::abs(a[0]-b[0]),std::abs(a[1]-b[1]),std::abs(a[2]-b[2])});}
 Color Pixel(const uint8_t* a){return {double(a[0]),double(a[1]),double(a[2])};}
+bool Compact(const std::vector<int>& points,int w){
+ int minX=w,minY=std::numeric_limits<int>::max(),maxX=0,maxY=0;
+ for(int i:points){minX=std::min(minX,i%w);maxX=std::max(maxX,i%w);minY=std::min(minY,i/w);maxY=std::max(maxY,i/w);}
+ return std::max(maxX-minX+1,maxY-minY+1)<=std::max(4.0,2.5*std::sqrt(double(points.size())));
+}
+void PreciseIslands(const std::vector<uint8_t>& a,int w,int h,Settings p,std::atomic<bool>& cancel,std::vector<uint8_t>& mask,std::vector<Group>& groups){
+ const int n=w*h;std::vector<uint8_t> luminance(n),seen(n);std::vector<uint32_t> visited(n),membership(n);uint32_t stamp=0;
+ for(int i=0;i<n;i++)luminance[i]=uint8_t((77*a[i*4]+150*a[i*4+1]+29*a[i*4+2]+128)>>8);
+ std::vector<int> queue,expanded,border;queue.reserve(n);
+ const double contrast=std::max(12.0,16-.2*p.strength);
+ // Sweep both polarities. Only actual eight-neighbour pixel connections count.
+ // Two neighbouring threshold levels must preserve a small, stable island.
+ // RGB passes also find coloured specks with nearly the same luminance as their surround.
+ for(int channel:{-1,0,1,2})for(int polarity:{1,-1})for(int level=24;level<=232;level+=8){
+  Cancel(cancel);std::fill(seen.begin(),seen.end(),0);
+  const auto above=[&](int i,int cut){const int value=channel<0?luminance[i]:a[i*4+channel];return (polarity>0?value:255-value)>=cut;};
+  for(int start=0;start<n;start++){
+   if((start&4095)==0)Cancel(cancel);if(seen[start]||!above(start,level))continue;
+   queue.clear();queue.push_back(start);seen[start]=1;bool valid=true;
+   for(size_t head=0;head<queue.size();head++){
+    if((head&4095)==0)Cancel(cancel);int i=queue[head],x=i%w,y=i/w;
+    if(a[i*4+3]<250||mask[i]||x==0||y==0||x==w-1||y==h-1)valid=false;
+    for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){
+     const int nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;const int j=ny*w+nx;
+     if(!seen[j]&&above(j,level)){seen[j]=1;queue.push_back(j);}
+    }
+   }
+   if(!valid||queue.size()>size_t(p.area))continue;
+   if(++stamp==0){std::fill(visited.begin(),visited.end(),0);std::fill(membership.begin(),membership.end(),0);stamp=1;}
+   expanded=queue;for(int i:expanded)visited[i]=stamp;
+   for(size_t head=0;head<expanded.size()&&valid;head++){
+    const int i=expanded[head],x=i%w,y=i/w;
+    if(a[i*4+3]<250||mask[i]||x<1||y<1||x>=w-1||y>=h-1){valid=false;break;}
+    for(int dy=-1;dy<=1&&valid;dy++)for(int dx=-1;dx<=1;dx++){
+     const int j=(y+dy)*w+x+dx;if(visited[j]==stamp)continue;visited[j]=stamp;
+     if(a[j*4+3]<250){valid=false;break;}
+     if(above(j,level-16)){expanded.push_back(j);if(expanded.size()>size_t(p.area)){valid=false;break;}}
+    }
+   }
+   // A growing gradient tip is not a separate speck. Reject unstable threshold slices.
+   if(!valid||expanded.size()>queue.size()*1.35+2)continue;
+   if(!Compact(expanded,w))continue;
+   for(int i:expanded)membership[i]=stamp;
+   border.clear();
+   for(int i:expanded){int x=i%w,y=i/w;for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){
+    int j=(y+dy)*w+x+dx;if(membership[j]!=stamp)border.push_back(j);
+   }}
+   std::sort(border.begin(),border.end());border.erase(std::unique(border.begin(),border.end()),border.end());
+   if(border.size()<8)continue;
+   Color center{};for(int c=0;c<3;c++){std::vector<uint8_t> values;for(int i:queue)values.push_back(a[i*4+c]);std::sort(values.begin(),values.end());center[c]=values[values.size()/2];}
+   for(int j:border)if(a[j*4+3]<250||Difference(a.data()+j*4,center)<contrast){valid=false;break;}
+   if(!valid)continue;
+   // Keep real colour boundaries: the immediate surround must support one paint family.
+   Color bg{};for(int c=0;c<3;c++){std::vector<uint8_t> values;for(int j:border)values.push_back(a[j*4+c]);std::sort(values.begin(),values.end());bg[c]=values[values.size()/2];}
+   for(int j:border)if(Difference(a.data()+j*4,bg)>32){valid=false;break;}
+   if(!valid)continue;
+   Group g;g.points=expanded;g.boundary=border;groups.push_back(std::move(g));for(int i:expanded)mask[i]=255;
+  }
+ }
+}
 std::vector<uint8_t> Tile(const std::vector<uint8_t>& a,int w,int h,Settings p,const std::array<bool,4>& edges,std::atomic<bool>& cancel){
  const int n=w*h;std::vector<uint8_t> dark(n),seed(n),uncertain(n),seen(n),mask(n);std::vector<int> queue;queue.reserve(n);std::vector<Group> groups;
  const int radii[]={3,5,8};const int dirs[][2]={{1,0},{0,1},{1,1},{1,-1}};const double threshold=std::max(2.0,16-.2*p.strength);
@@ -38,23 +98,50 @@ std::vector<uint8_t> Tile(const std::vector<uint8_t>& a,int w,int h,Settings p,c
  }
  for(int i=0;i<n;i++)if(uncertain[i])dark[i]=1;
  std::vector<uint32_t> visited(n),membership(n);uint32_t stamp=0;const int islandRadii[]={2,3,5,8};const int ringDirs[][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}};
+ // A second, conservative rescue separates pronounced specks from subtly varying paint.
+ // Keep the original pass first; the tolerant pass requires at least 12 levels of contrast.
+ for(int tolerance:{3,8}){
+ const double islandThreshold=std::max(threshold,tolerance==3?0.0:12.0);
  for(int y=8;y<h-8;y++){Cancel(cancel);for(int x=8;x<w-8;x++){int start=y*w+x;if(!dark[start]||mask[start])continue;
   for(int radius:islandRadii){int ring[8],support[8],supportCount=0;for(int j=0;j<8;j++)ring[j]=(y+ringDirs[j][1]*radius)*w+x+ringDirs[j][0]*radius;
-   for(int j:ring){Color color=Pixel(a.data()+j*4);int ids[8],count=0;for(int k:ring)if(a[k*4+3]>=250&&Difference(a.data()+k*4,color)<=3)ids[count++]=k;if(count>supportCount){supportCount=count;std::copy(ids,ids+count,support);}}
+   for(int j:ring){Color color=Pixel(a.data()+j*4);int ids[8],count=0;for(int k:ring)if(a[k*4+3]>=250&&Difference(a.data()+k*4,color)<=tolerance)ids[count++]=k;if(count>supportCount){supportCount=count;std::copy(ids,ids+count,support);}}
    if(supportCount<6)continue;Color bg;for(int c=0;c<3;c++){uint8_t values[8];for(int j=0;j<supportCount;j++)values[j]=a[support[j]*4+c];std::sort(values,values+supportCount);bg[c]=values[supportCount/2];}
-   if(Difference(a.data()+start*4,bg)<threshold)continue;
+   if(Difference(a.data()+start*4,bg)<islandThreshold)continue;
    if(++stamp==0){std::fill(visited.begin(),visited.end(),0);std::fill(membership.begin(),membership.end(),0);stamp=1;}
    queue.clear();queue.push_back(start);visited[start]=stamp;bool valid=true;
    for(size_t head=0;head<queue.size()&&valid;head++){int i=queue[head],px=i%w,py=i/w;if(px<2||py<2||px>=w-2||py>=h-2||a[i*4+3]<250||mask[i]){valid=false;break;}
-    for(int dy=-1;dy<=1&&valid;dy++)for(int dx=-1;dx<=1;dx++){int j=(py+dy)*w+px+dx;if(visited[j]==stamp)continue;visited[j]=stamp;if(a[j*4+3]<250){valid=false;break;}if(Difference(a.data()+j*4,bg)>3){queue.push_back(j);if(queue.size()>size_t(p.area)){valid=false;break;}}}}
+    for(int dy=-1;dy<=1&&valid;dy++)for(int dx=-1;dx<=1;dx++){int j=(py+dy)*w+px+dx;if(visited[j]==stamp)continue;visited[j]=stamp;if(a[j*4+3]<250){valid=false;break;}if(Difference(a.data()+j*4,bg)>tolerance){queue.push_back(j);if(queue.size()>size_t(p.area)){valid=false;break;}}}}
    if(!valid)continue;for(int i:queue)membership[i]=stamp;
-   for(int i:queue){int px=i%w,py=i/w;for(int dy=-2;dy<=2&&valid;dy++)for(int dx=-2;dx<=2;dx++){int j=(py+dy)*w+px+dx;if(membership[j]==stamp)continue;if(a[j*4+3]<250){valid=false;break;}if(Difference(a.data()+j*4,bg)>3){int ux=Sign(dx),uy=Sign(dy),back=(py-uy)*w+px-ux,fx=px+dx+ux,fy=py+dy+uy;if(membership[back]==stamp&&fx>=0&&fy>=0&&fx<w&&fy<h&&Difference(a.data()+(fy*w+fx)*4,bg)>3){valid=false;break;}}}if(!valid)break;}
+   for(int i:queue){int px=i%w,py=i/w;for(int dy=-2;dy<=2&&valid;dy++)for(int dx=-2;dx<=2;dx++){int j=(py+dy)*w+px+dx;if(membership[j]==stamp)continue;if(a[j*4+3]<250){valid=false;break;}if(Difference(a.data()+j*4,bg)>tolerance){int ux=Sign(dx),uy=Sign(dy),back=(py-uy)*w+px-ux,fx=px+dx+ux,fy=py+dy+uy;if(membership[back]==stamp&&fx>=0&&fy>=0&&fx<w&&fy<h&&Difference(a.data()+(fy*w+fx)*4,bg)>tolerance){valid=false;break;}}}if(!valid)break;}
    if(!valid)continue;Group g;g.points=queue;g.solid=true;g.background=bg;groups.push_back(std::move(g));for(int i:queue)mask[i]=255;break;
   }
  }}
+ }
+ // Tiny bright holes inside dark ink need immediate-boundary evidence, not distant rings.
+ // Eight-connectivity keeps diagonal openings attached; transparent or open holes are rejected.
+ std::fill(seen.begin(),seen.end(),0);
+ const auto bright=[&](int i){return std::max({a[i*4],a[i*4+1],a[i*4+2]})>32;};
+ for(int start=0;start<n;start++){
+  if((start&4095)==0)Cancel(cancel);if(seen[start]||!bright(start))continue;
+  queue.clear();queue.push_back(start);seen[start]=1;bool valid=true;std::vector<int> border;
+  for(size_t head=0;head<queue.size();head++){
+   if((head&4095)==0)Cancel(cancel);int i=queue[head],x=i%w,y=i/w;
+   if(a[i*4+3]<250||mask[i]||x==0||y==0||x==w-1||y==h-1)valid=false;
+   for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){
+    int nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;int j=ny*w+nx;
+    if(a[j*4+3]<250)valid=false;
+    if(bright(j)){if(!seen[j]){seen[j]=1;queue.push_back(j);}}
+    else if(queue.size()<=size_t(p.area))border.push_back(j);
+   }
+  }
+  if(!valid||queue.size()>size_t(p.area)||border.size()<8)continue;
+  Color bg{};for(int c=0;c<3;c++){std::vector<uint8_t> values;values.reserve(border.size());for(int j:border)values.push_back(a[j*4+c]);std::sort(values.begin(),values.end());bg[c]=values[values.size()/2];}
+  bool contrast=false;for(int i:queue)if(Difference(a.data()+i*4,bg)>=std::max(12.0,threshold)){contrast=true;break;}if(!contrast)continue;
+  Group g;g.points=queue;g.solid=true;g.background=bg;groups.push_back(std::move(g));for(int i:queue)mask[i]=255;
+ }
  std::vector<uint8_t> output(a.size());std::vector<uint32_t> sampleSeen(n);uint32_t sampleStamp=0;
  struct Cluster{Color mean;std::vector<int> ids;};
- for(const Group& group:groups){Cancel(cancel);if(group.solid){for(int i:group.points){for(int c=0;c<3;c++)output[i*4+c]=uint8_t(group.background[c]);output[i*4+3]=255;}continue;}
+ for(const Group& group:groups){Cancel(cancel);if(p.precise&&!Compact(group.points,w))continue;if(group.solid){for(int i:group.points){for(int c=0;c<3;c++)output[i*4+c]=uint8_t(group.background[c]);output[i*4+3]=255;}continue;}
   ++sampleStamp;std::vector<int> samples;for(int i:group.points){int x=i%w,y=i/w;for(int dy=-5;dy<=5;dy++)for(int dx=-5;dx<=5;dx++){if(dx*dx+dy*dy>25)continue;int nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;int j=ny*w+nx;if(!dark[j]&&a[j*4+3]>=250&&sampleSeen[j]!=sampleStamp){sampleSeen[j]=sampleStamp;samples.push_back(j);}}}
   if(samples.size()<4)continue;std::vector<Cluster> clusters;
   for(int j:samples){Color rgb=Pixel(a.data()+j*4);int best=-1;double limit=400;for(size_t c=0;c<clusters.size();c++){double distance=0;for(int k=0;k<3;k++){double d=clusters[c].mean[k]-rgb[k];distance+=d*d;}if(distance<=limit){limit=distance;best=int(c);}}
@@ -62,6 +149,16 @@ std::vector<uint8_t> Tile(const std::vector<uint8_t>& a,int w,int h,Settings p,c
   std::stable_sort(clusters.begin(),clusters.end(),[](const Cluster& a,const Cluster& b){return a.ids.size()>b.ids.size();});if(double(clusters[0].ids.size())/double(samples.size())<.85)continue;
   for(int i:group.points){int x=i%w,y=i/w;double sum=0,r=0,g=0,b=0;for(int j:clusters[0].ids){int dx=x-j%w,dy=y-j/w;double weight=1.0/(1+dx*dx+dy*dy);sum+=weight;r+=a[j*4]*weight;g+=a[j*4+1]*weight;b+=a[j*4+2]*weight;}
    output[i*4]=uint8_t(std::floor(r/sum+.5));output[i*4+1]=uint8_t(std::floor(g/sum+.5));output[i*4+2]=uint8_t(std::floor(b/sum+.5));output[i*4+3]=255;}
+ }
+ if(p.precise){
+  // A classified candidate may have failed the ordinary repair. Only successful
+  // output pixels are already handled; do not let speculative masks block rescue.
+  for(int i=0;i<n;i++)mask[i]=output[i*4+3];groups.clear();
+  PreciseIslands(a,w,h,p,cancel,mask,groups);
+  for(const Group& group:groups){Cancel(cancel);for(int i:group.points){Color sum{};double weights=0;
+   for(int j:group.boundary){const int dx=i%w-j%w,dy=i/w-j/w;const double weight=1.0/(1+dx*dx+dy*dy);weights+=weight;for(int c=0;c<3;c++)sum[c]+=a[j*4+c]*weight;}
+   for(int c=0;c<3;c++)output[i*4+c]=uint8_t(std::floor(sum[c]/weights+.5));output[i*4+3]=255;
+  }}
  }
  return output;
 }

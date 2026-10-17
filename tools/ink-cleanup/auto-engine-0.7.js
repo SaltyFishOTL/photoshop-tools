@@ -65,6 +65,8 @@ function detect(rgba,w,h,p,selection=null,edges={left:true,right:true,top:true,b
   // Unlike the wide-scale residual mask, this cannot connect clean skin to ink.
   const visited=new Int32Array(n);let stamp=0;
   const delta=(i,c)=>Math.max(Math.abs(rgba[i*4]-c[0]),Math.abs(rgba[i*4+1]-c[1]),Math.abs(rgba[i*4+2]-c[2]));
+  for(const tolerance of [3,8]){
+  const islandThreshold=Math.max(threshold,tolerance===3?0:12);
   for(let y=8;y<h-8;y++)for(let x=8;x<w-8;x++){
     const start=y*w+x;if(!dark[start]||mask[start])continue;
     for(const radius of [2,3,5,8]){
@@ -73,10 +75,10 @@ function detect(rgba,w,h,p,selection=null,edges={left:true,right:true,top:true,b
         const j=(y+dy*radius)*w+x+dx*radius;ring.push(j);
       }
       let support=[];
-      for(const j of ring){const color=Array.from(rgba.subarray(j*4,j*4+3)),ids=ring.filter(k=>rgba[k*4+3]>=250&&delta(k,color)<=3);if(ids.length>support.length)support=ids;}
+      for(const j of ring){const color=Array.from(rgba.subarray(j*4,j*4+3)),ids=ring.filter(k=>rgba[k*4+3]>=250&&delta(k,color)<=tolerance);if(ids.length>support.length)support=ids;}
       if(support.length<6)continue;
       const bg=[0,1,2].map(c=>support.map(j=>rgba[j*4+c]).sort((a,b)=>a-b)[Math.floor(support.length/2)]);
-      if(delta(start,bg)<threshold)continue;
+      if(delta(start,bg)<islandThreshold)continue;
       stamp++;const points=[start];visited[start]=stamp;let valid=true;
       for(let head=0;head<points.length&&valid;head++){
         const i=points[head],px=i%w,py=Math.floor(i/w);
@@ -84,7 +86,7 @@ function detect(rgba,w,h,p,selection=null,edges={left:true,right:true,top:true,b
         for(let dy=-1;dy<=1&&valid;dy++)for(let dx=-1;dx<=1;dx++){
           const j=(py+dy)*w+px+dx;if(visited[j]===stamp)continue;visited[j]=stamp;
           if(rgba[j*4+3]<250){valid=false;break;}
-          if(delta(j,bg)>3){points.push(j);if(points.length>p.area){valid=false;break;}}
+          if(delta(j,bg)>tolerance){points.push(j);if(points.length>p.area){valid=false;break;}}
         }
       }
       if(!valid)continue;
@@ -93,15 +95,36 @@ function detect(rgba,w,h,p,selection=null,edges={left:true,right:true,top:true,b
       for(const i of points){const px=i%w,py=Math.floor(i/w);for(let dy=-2;dy<=2&&valid;dy++)for(let dx=-2;dx<=2;dx++){
         const j=(py+dy)*w+px+dx;if(set.has(j))continue;
         if(rgba[j*4+3]<250){valid=false;break;}
-        if(delta(j,bg)>3){
+        if(delta(j,bg)>tolerance){
           const ux=Math.sign(dx),uy=Math.sign(dy),back=(py-uy)*w+px-ux,fx=px+dx+ux,fy=py+dy+uy;
-          if(set.has(back)&&fx>=0&&fy>=0&&fx<w&&fy<h&&delta(fy*w+fx,bg)>3){valid=false;break;}
+          if(set.has(back)&&fx>=0&&fy>=0&&fx<w&&fy<h&&delta(fy*w+fx,bg)>tolerance){valid=false;break;}
         }
       }if(!valid)break;}
       if(!valid)continue;
       points.background=bg;groups.push(points);for(const i of points)mask[i]=255;
       break;
     }
+  }
+  }
+  // Immediate-boundary rescue for bright holes fully enclosed by dark ink.
+  seen.fill(0);const bright=i=>Math.max(rgba[i*4],rgba[i*4+1],rgba[i*4+2])>32;
+  for(let start=0;start<n;start++){
+    if(seen[start]||!bright(start))continue;
+    const points=[start],border=[];seen[start]=1;let valid=true;
+    for(let head=0;head<points.length;head++){
+      const i=points[head],x=i%w,y=Math.floor(i/w);
+      if(rgba[i*4+3]<250||mask[i]||x===0||y===0||x===w-1||y===h-1||(selection&&selection[i]<128))valid=false;
+      for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+        const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;const j=ny*w+nx;
+        if(rgba[j*4+3]<250)valid=false;
+        if(bright(j)){if(!seen[j]){seen[j]=1;points.push(j);}}
+        else if(points.length<=p.area)border.push(j);
+      }
+    }
+    if(!valid||points.length>p.area||border.length<8)continue;
+    const bg=[0,1,2].map(c=>border.map(j=>rgba[j*4+c]).sort((a,b)=>a-b)[Math.floor(border.length/2)]);
+    if(!points.some(i=>delta(i,bg)>=Math.max(12,threshold)))continue;
+    points.background=bg;groups.push(points);for(const i of points)mask[i]=255;
   }
   return {groups,mask,dark};
 }

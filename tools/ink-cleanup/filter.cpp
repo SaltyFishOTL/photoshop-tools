@@ -18,8 +18,9 @@
 namespace {
 HINSTANCE instance=nullptr;
 constexpr UINT Done=WM_APP+41,Progress=WM_APP+42;
-constexpr DescriptorKeyID Strength='IcSt',Area='IcAr';
-struct Saved {uint32_t magic=0x49433037;int strength=60,area=60;};
+constexpr DescriptorKeyID Strength='IcSt',Area='IcAr',Precise='IcPr';
+struct LegacySaved {uint32_t magic;int strength,area;};
+struct Saved {uint32_t magic=0x49433037;int strength=60,area=60,precise=0;};
 struct State {
  FilterRecord* f=nullptr;bool show=false,busy=false,pending=false,closing=false,ready=false,initializing=false;
  int w=0,h=0;Settings settings;std::vector<uint8_t> input,patch;std::atomic<bool> cancel{false};std::atomic<int> percent{0};
@@ -29,14 +30,14 @@ struct State {
 };
 void Check(int16 code){if(code)throw code;}
 void ClearRects(FilterRecord* f){f->inRect={};f->outRect={};f->maskRect={};if(f->bigDocumentData){f->bigDocumentData->inRect32={};f->bigDocumentData->outRect32={};f->bigDocumentData->maskRect32={};}}
-void ReadSettings(State& s){auto f=s.f;if(f->parameters&&f->handleProcs){auto hp=f->handleProcs;if(hp->getSizeProc(f->parameters)==sizeof(Saved)){auto p=(Saved*)hp->lockProc(f->parameters,true);if(p&&p->magic==0x49433037)s.settings={p->strength,p->area};hp->unlockProc(f->parameters);}}
- auto dp=f->descriptorParameters;if(dp&&dp->descriptor&&dp->readDescriptorProcs){auto rp=dp->readDescriptorProcs;DescriptorKeyID keys[]={Strength,Area,0};auto token=rp->openReadDescriptorProc(dp->descriptor,keys);if(!token)throw std::runtime_error("Cannot read filter parameters");DescriptorKeyID key;DescriptorTypeID type;int32 flags;int16 error=0;
- while(rp->getKeyProc(token,&key,&type,&flags)){int32 value=0;if(key==Strength||key==Area){int16 e=rp->getIntegerProc(token,&value);if(e)error=e;else if(key==Strength)s.settings.strength=value;else s.settings.area=value;}}
+void ReadSettings(State& s){auto f=s.f;int precise=0;if(f->parameters&&f->handleProcs){auto hp=f->handleProcs;auto size=hp->getSizeProc(f->parameters);if(size==sizeof(Saved)||size==sizeof(LegacySaved)){auto p=hp->lockProc(f->parameters,true);if(p){Saved saved{};memcpy(&saved,p,size);if(saved.magic==0x49433037){s.settings={saved.strength,saved.area};precise=saved.precise;}}hp->unlockProc(f->parameters);}}
+ auto dp=f->descriptorParameters;if(dp&&dp->descriptor&&dp->readDescriptorProcs){precise=0;auto rp=dp->readDescriptorProcs;DescriptorKeyID keys[]={Strength,Area,0};auto token=rp->openReadDescriptorProc(dp->descriptor,keys);if(!token)throw std::runtime_error("Cannot read filter parameters");DescriptorKeyID key;DescriptorTypeID type;int32 flags;int16 error=0;
+ while(rp->getKeyProc(token,&key,&type,&flags)){int32 value=0;if(key==Strength||key==Area||key==Precise){int16 e=rp->getIntegerProc(token,&value);if(e)error=e;else if(key==Strength)s.settings.strength=value;else if(key==Area)s.settings.area=value;else precise=value;}}
  int16 end=rp->closeReadDescriptorProc(token);if(f->handleProcs)f->handleProcs->disposeProc(dp->descriptor);dp->descriptor=nullptr;Check(error?error:end);s.show=dp->playInfo==plugInDialogDisplay;}
- if(s.settings.strength<0||s.settings.strength>100||s.settings.area<1||s.settings.area>1000)throw std::runtime_error("Invalid saved parameters");
+ if(s.settings.strength<0||s.settings.strength>100||s.settings.area<1||s.settings.area>1000||precise<0||precise>1)throw std::runtime_error("Invalid saved parameters");s.settings.precise=precise!=0;
 }
-void SaveSettings(State& s){auto f=s.f;auto hp=f->handleProcs;if(hp){if(!f->parameters)f->parameters=hp->newProc(sizeof(Saved));if(!f->parameters)throw std::bad_alloc();auto p=(Saved*)hp->lockProc(f->parameters,true);if(!p)throw std::bad_alloc();*p={0x49433037,s.settings.strength,s.settings.area};hp->unlockProc(f->parameters);}
- auto dp=f->descriptorParameters;if(dp&&dp->writeDescriptorProcs){auto wp=dp->writeDescriptorProcs;auto token=wp->openWriteDescriptorProc();if(!token)throw std::runtime_error("Cannot record filter parameters");int16 a=wp->putIntegerProc(token,Strength,s.settings.strength),b=wp->putIntegerProc(token,Area,s.settings.area);PIDescriptorHandle handle=nullptr;int16 c=wp->closeWriteDescriptorProc(token,&handle);if(a||b||c){if(handle&&hp)hp->disposeProc(handle);Check(a?a:b?b:c);}if(dp->descriptor&&hp)hp->disposeProc(dp->descriptor);dp->descriptor=handle;dp->recordInfo=plugInDialogOptional;}
+void SaveSettings(State& s){auto f=s.f;auto hp=f->handleProcs;if(hp){if(!f->parameters||hp->getSizeProc(f->parameters)!=sizeof(Saved)){auto replacement=hp->newProc(sizeof(Saved));if(!replacement)throw std::bad_alloc();if(f->parameters)hp->disposeProc(f->parameters);f->parameters=replacement;}auto p=(Saved*)hp->lockProc(f->parameters,true);if(!p)throw std::bad_alloc();*p={0x49433037,s.settings.strength,s.settings.area,int(s.settings.precise)};hp->unlockProc(f->parameters);}
+ auto dp=f->descriptorParameters;if(dp&&dp->writeDescriptorProcs){auto wp=dp->writeDescriptorProcs;auto token=wp->openWriteDescriptorProc();if(!token)throw std::runtime_error("Cannot record filter parameters");int16 a=wp->putIntegerProc(token,Strength,s.settings.strength),b=wp->putIntegerProc(token,Area,s.settings.area),c=wp->putIntegerProc(token,Precise,int(s.settings.precise));PIDescriptorHandle handle=nullptr;int16 d=wp->closeWriteDescriptorProc(token,&handle);if(a||b||c||d){if(handle&&hp)hp->disposeProc(handle);Check(a?a:b?b:c?c:d);}if(dp->descriptor&&hp)hp->disposeProc(dp->descriptor);dp->descriptor=handle;dp->recordInfo=plugInDialogOptional;}
 }
 void ReadImage(State& s){auto f=s.f;if(f->imageMode!=plugInModeRGBColor||f->depth!=8||f->planes<3||!f->bigDocumentData||!f->advanceState)throw std::runtime_error("Requires Photoshop RGB 8-bit color layer");
  auto big=f->bigDocumentData;big->PluginUsing32BitCoordinates=1;s.w=big->imageSize32.h;s.h=big->imageSize32.v;
@@ -62,7 +63,7 @@ LRESULT CALLBACK Preview(HWND h,UINT msg,WPARAM wp,LPARAM lp){auto s=Get(GetPare
  BITMAPINFO bi{};bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bi.bmiHeader.biWidth=w;bi.bmiHeader.biHeight=-hg;bi.bmiHeader.biPlanes=1;bi.bmiHeader.biBitCount=32;bi.bmiHeader.biCompression=BI_RGB;SetDIBitsToDevice(dc,0,0,w,hg,0,0,0,hg,display.data(),&bi,DIB_RGB_COLORS);EndPaint(h,&ps);return 0;}}
  return DefWindowProcW(h,msg,wp,lp);
 }
-bool ReadControls(State& s){BOOL a,b;int strength=GetDlgItemInt(s.dialog,120,&a,false),area=GetDlgItemInt(s.dialog,121,&b,false);if(!a||!b||strength>100||area<1||area>1000){SetDlgItemTextW(s.dialog,124,L"识别强度 0–100；最大面积 1–1000。");return false;}s.settings={strength,area};return true;}
+bool ReadControls(State& s){BOOL a,b;int strength=GetDlgItemInt(s.dialog,120,&a,false),area=GetDlgItemInt(s.dialog,121,&b,false);if(!a||!b||strength>100||area<1||area>1000){SetDlgItemTextW(s.dialog,124,L"识别强度 0–100；最大面积 1–1000。");return false;}s.settings={strength,area,IsDlgButtonChecked(s.dialog,125)==BST_CHECKED};return true;}
 void Launch(State& s){
  if(s.busy){s.pending=true;return;}s.pending=false;if(!ReadControls(s)){EnableWindow(GetDlgItem(s.dialog,IDOK),false);return;}
  if(!s.cache)s.cache=std::make_unique<PreviewCache>(s.w,s.h);s.cache->Configure(s.settings);
@@ -74,15 +75,15 @@ void Launch(State& s){
  SetDlgItemTextW(s.dialog,124,s.applyRequested?L"正在计算剩余画布，已完成的预览会复用…":L"正在计算当前视野…");auto p=s.settings;
  s.worker=std::thread([&s,p,ids]{try{s.batch=CleanTiles(s.input,s.w,s.h,p,s.cancel,ids,[&s](int percent){PostMessageW(s.dialog,Progress,percent,0);});}catch(const std::exception& e){s.error=e.what();}PostMessageW(s.dialog,Done,0,0);});
 }
-INT_PTR CALLBACK Dialog(HWND h,UINT msg,WPARAM wp,LPARAM lp){auto s=Get(h);if(msg==WM_INITDIALOG){s=(State*)lp;SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)s);s->dialog=h;s->initializing=true;SetDlgItemInt(h,120,s->settings.strength,false);SetDlgItemInt(h,121,s->settings.area,false);CheckDlgButton(h,122,BST_CHECKED);for(auto text:{L"50%",L"100%",L"200%",L"400%"})SendDlgItemMessageW(h,123,CB_ADDSTRING,0,(LPARAM)text);SendDlgItemMessageW(h,123,CB_SETCURSEL,1,0);s->initializing=false;Launch(*s);return TRUE;}if(!s)return FALSE;
+INT_PTR CALLBACK Dialog(HWND h,UINT msg,WPARAM wp,LPARAM lp){auto s=Get(h);if(msg==WM_INITDIALOG){s=(State*)lp;SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)s);s->dialog=h;s->initializing=true;SetDlgItemInt(h,120,s->settings.strength,false);SetDlgItemInt(h,121,s->settings.area,false);CheckDlgButton(h,122,BST_CHECKED);CheckDlgButton(h,125,s->settings.precise?BST_CHECKED:BST_UNCHECKED);for(auto text:{L"50%",L"100%",L"200%",L"400%"})SendDlgItemMessageW(h,123,CB_ADDSTRING,0,(LPARAM)text);SendDlgItemMessageW(h,123,CB_SETCURSEL,1,0);s->initializing=false;Launch(*s);return TRUE;}if(!s)return FALSE;
  if(msg==WM_TIMER){KillTimer(h,1);Launch(*s);return TRUE;}
  if(msg==Progress){std::wstring text=(s->applyRequested?L"正在计算剩余画布… ":L"正在计算当前视野… ")+std::to_wstring(wp)+L"%";SetDlgItemTextW(h,124,text.c_str());return TRUE;}
  if(msg==Done){if(s->worker.joinable())s->worker.join();s->busy=false;if(s->closing){EndDialog(h,IDCANCEL);return TRUE;}
   if(!s->cancel&&s->error.empty()&&s->jobRevision==s->revision)s->cache->Merge(s->batch);s->batch.clear();
-  if(!s->cancel&&!s->error.empty()){s->applyRequested=false;EnableWindow(GetDlgItem(h,120),true);EnableWindow(GetDlgItem(h,121),true);EnableWindow(GetDlgItem(h,IDOK),false);SetDlgItemTextW(h,124,L"计算未完成，请调整参数重试或取消。");return TRUE;}
+  if(!s->cancel&&!s->error.empty()){s->applyRequested=false;EnableWindow(GetDlgItem(h,120),true);EnableWindow(GetDlgItem(h,121),true);EnableWindow(GetDlgItem(h,125),true);EnableWindow(GetDlgItem(h,IDOK),false);SetDlgItemTextW(h,124,L"计算未完成，请调整参数重试或取消。");return TRUE;}
   Launch(*s);return TRUE;}
  if(msg==WM_CLOSE||(msg==WM_COMMAND&&LOWORD(wp)==IDCANCEL)){KillTimer(h,1);if(s->busy){s->closing=true;s->pending=false;s->cancel=true;SetDlgItemTextW(h,124,L"正在取消…");}else EndDialog(h,IDCANCEL);return TRUE;}
- if(msg==WM_COMMAND){int id=LOWORD(wp),code=HIWORD(wp);if((id==120||id==121)&&code==EN_CHANGE&&!s->initializing){s->revision++;s->ready=false;EnableWindow(GetDlgItem(h,IDOK),false);s->cancel=true;SetTimer(h,1,300,nullptr);return TRUE;}if(id==122){InvalidateRect(GetDlgItem(h,110),nullptr,false);return TRUE;}if(id==123&&code==CBN_SELCHANGE){int index=(int)SendDlgItemMessageW(h,123,CB_GETCURSEL,0,0);s->zoom=index==0?.5:index==1?1:index==2?2:4;s->ready=false;InvalidateRect(GetDlgItem(h,110),nullptr,false);SetTimer(h,1,120,nullptr);return TRUE;}if(id==IDOK&&!s->applyRequested){if(!ReadControls(*s))return TRUE;KillTimer(h,1);s->applyRequested=true;EnableWindow(GetDlgItem(h,120),false);EnableWindow(GetDlgItem(h,121),false);EnableWindow(GetDlgItem(h,IDOK),false);Launch(*s);return TRUE;}}
+ if(msg==WM_COMMAND){int id=LOWORD(wp),code=HIWORD(wp);if((((id==120||id==121)&&code==EN_CHANGE)||(id==125&&code==BN_CLICKED))&&!s->initializing){s->revision++;s->ready=false;EnableWindow(GetDlgItem(h,IDOK),false);s->cancel=true;SetTimer(h,1,300,nullptr);return TRUE;}if(id==122){InvalidateRect(GetDlgItem(h,110),nullptr,false);return TRUE;}if(id==123&&code==CBN_SELCHANGE){int index=(int)SendDlgItemMessageW(h,123,CB_GETCURSEL,0,0);s->zoom=index==0?.5:index==1?1:index==2?2:4;s->ready=false;InvalidateRect(GetDlgItem(h,110),nullptr,false);SetTimer(h,1,120,nullptr);return TRUE;}if(id==IDOK&&!s->applyRequested){if(!ReadControls(*s))return TRUE;KillTimer(h,1);s->applyRequested=true;EnableWindow(GetDlgItem(h,120),false);EnableWindow(GetDlgItem(h,121),false);EnableWindow(GetDlgItem(h,125),false);EnableWindow(GetDlgItem(h,IDOK),false);Launch(*s);return TRUE;}}
  return FALSE;
 }
 void Compute(State& s){if(s.show){WNDCLASSW wc{};wc.lpfnWndProc=Preview;wc.hInstance=instance;wc.lpszClassName=L"InkPreview07";wc.hCursor=LoadCursorW(nullptr,IDC_HAND);RegisterClassW(&wc);HWND parent=s.f->platformData?(HWND)((PlatformData*)s.f->platformData)->hwnd:nullptr;auto result=DialogBoxParamW(instance,MAKEINTRESOURCEW(101),parent,Dialog,(LPARAM)&s);if(result==-1)throw std::runtime_error("Cannot open filter dialog");if(result!=IDOK)throw int16(userCanceledErr);}
@@ -95,7 +96,7 @@ void WriteImage(State& s){auto f=s.f;auto big=f->bigDocumentData;auto bounds=big
 }
 }
 extern "C" __declspec(dllexport) void PluginMain(const int16 selector,FilterRecord* f,intptr_t* data,int16* result){
- *result=noErr;try {if(selector==filterSelectorAbout){auto about=(AboutRecord*)f;HWND owner=about->platformData?(HWND)((PlatformData*)about->platformData)->hwnd:nullptr;MessageBoxW(owner,L"全颜色碎点清理 0.9.0\n清理算法与已确认的 0.7 版相同。",L"碎点清理",MB_OK);return;}
+ *result=noErr;try {if(selector==filterSelectorAbout){auto about=(AboutRecord*)f;HWND owner=about->platformData?(HWND)((PlatformData*)about->platformData)->hwnd:nullptr;MessageBoxW(owner,L"全颜色碎点清理 0.11.0\n精细识别：检查小区域的实际封闭边界。",L"碎点清理",MB_OK);return;}
  State* s=(State*)*data;
  if(selector==filterSelectorParameters||selector==filterSelectorPrepare){if(!s){s=new State;*data=(intptr_t)s;}s->f=f;if(selector==filterSelectorParameters)s->show=true;else {f->bufferSpace=0;if(f->bigDocumentData)f->bigDocumentData->PluginUsing32BitCoordinates=1;}return;}
  if(selector==filterSelectorStart){if(!s){s=new State;*data=(intptr_t)s;}s->f=f;ReadSettings(*s);ReadImage(*s);Compute(*s);WriteImage(*s);SaveSettings(*s);ClearRects(f);return;}

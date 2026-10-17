@@ -9,7 +9,19 @@ int main(){try{
  std::atomic<bool> cancel=false;Settings p{60,60};PreviewCache cache(w,h);cache.Configure(p);ImageRect visible{10,10,400,300};auto missing=cache.Missing(visible);require(missing==std::vector<int>{0},"preview must request one tile, not full image");
  auto start=std::chrono::steady_clock::now();auto first=CleanTiles(a,w,h,p,cancel,missing);double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();cache.Merge(first);require(cache.Missing(visible).empty(),"unchanged viewport should reuse cache");require(cache.pixels[(30*w+30)*4+3]==255,"visible dot not repaired");require(cache.pixels[(30*w+1054)*4+3]==0,"offscreen tile was computed");
  auto rest=cache.Missing({0,0,w,h});require(rest.size()==11,"apply must reuse one of twelve tiles");cache.Merge(CleanTiles(a,w,h,p,cancel,rest));auto whole=Clean(a,w,h,p,cancel);require(cache.pixels==whole,"preview plus remaining tiles must equal full render");
+ cache.Configure({60,60,true});require(cache.Missing(visible)==std::vector<int>{0},"precision toggle must invalidate cache");cache.Configure(p);cache.Merge(first);require(cache.Missing(visible).empty(),"restored ordinary mode cache failed");
  cache.Configure({60,1});require(cache.Missing(visible)==std::vector<int>{0},"parameter change must invalidate cache");
  bool stopped=false;try{CleanTiles(a,w,h,p,cancel,{0,1},[&](int){cancel=true;});}catch(const std::exception&){stopped=true;}require(stopped,"cancellation between tiles ignored");
+ // Move the same enclosed dot across the 1024-pixel tile boundary. The patch
+ // must match a single-tile rendering, with no seam or accidental highlight cut.
+ cancel=false;int sw=96,sh=96,wide=2110;std::vector<uint8_t> scene(sw*sh*4,255),spread(wide*sh*4,255);
+ for(size_t i=0;i<scene.size();i+=4)for(int c=0;c<3;c++)scene[i+c]=70;
+ for(size_t i=0;i<spread.size();i+=4)for(int c=0;c<3;c++)spread[i+c]=70;
+ for(int y=20;y<75;y++)for(int x=44;x<75;x++)for(int c=0;c<3;c++)scene[(y*sw+x)*4+c]=180;
+ for(int y=40;y<43;y++)for(int x=40;x<43;x++)for(int c=0;c<3;c++)scene[(y*sw+x)*4+c]=180;
+ for(int offset:{982,2006})for(int y=0;y<sh;y++)memcpy(spread.data()+(y*wide+offset)*4,scene.data()+y*sw*4,sw*4);
+ auto reference=Clean(scene,sw,sh,{60,60,true},cancel),tiled=Clean(spread,wide,sh,{60,60,true},cancel);
+ require(reference[(41*sw+41)*4+3]==255,"precision fixture dot missed");
+ for(int offset:{982,2006})for(int y=0;y<sh;y++)require(memcmp(tiled.data()+(y*wide+offset)*4,reference.data()+y*sw*4,sw*4)==0,"precision tile seam differs from isolated render");
  std::cout<<"PASS 3200x2100: preview 1/12 tiles, reuse cache, apply remaining 11, exact full-render equality, parameter invalidation, cancellation; preview_seconds="<<seconds<<'\n';return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
